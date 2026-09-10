@@ -1,0 +1,81 @@
+# Alpine avalanche likelihood baseline
+
+This is a research baseline for estimating the probability that an avalanche
+release will be recorded in a terrain cell during a short forecast horizon. It
+is **not** an avalanche-safety product and must not be used to decide whether
+terrain is safe. Operational use needs local avalanche-service review,
+calibration, monitoring, and a conservative human decision process.
+
+## Why this design
+
+The visual backbone is the established ImageNet-pretrained **ResNet-50**. It
+encodes each image in a historical sequence; a GRU then combines the image
+embeddings and time-aligned weather/snowpack measurements to predict an event
+in the next 6 hours. The output is a calibrated probability, not a binary
+"avalanche/no avalanche" verdict.
+
+Use Sentinel-1 GRD (VV/VH) as the primary image source: SAR works through
+clouds and without daylight. Use cloud-masked Sentinel-2 Level-2A (B03, B04,
+B08, B11, B12) as an optional additional branch or a separately trained
+model. Sentinel-2’s five-day nominal revisit and cloud cover make it unsuitable
+as the only source for a few-hour target. Copernicus imagery should be found
+through the [CDSE STAC catalogue](https://documentation.dataspace.copernicus.eu/APIs/STAC.html).
+ESA documents Sentinel-2’s 13 bands and 10–60 m resolutions
+[here](https://www.esa.int/Applications/Observing_the_Earth/Copernicus/Sentinel-2/Facts_and_figures).
+
+For actual next-hours skill, include frequent, time-aligned predictors such as
+new snow, wind speed/direction, air temperature, precipitation, snow depth,
+and—where available—snowpack/stability observations. Image history detects
+spatial context and surface change; it cannot observe a rapidly changing weak
+layer reliably enough on its own.
+
+## Data contract
+
+Prepare one compressed `.npz` per sample and a CSV manifest. A sample represents
+one fixed projected terrain tile ending at `analysis_time`:
+
+```text
+sample.npz
+  imagery: float32 [T, C, H, W]  # Sentinel-1: C=2, ordered VV,VH
+  meteo:   float32 [T, M]        # standardized, no values after analysis_time
+  label:   int64 scalar          # 1 if a validated release occurs within horizon
+```
+
+The manifest must contain `path,split,tile_id,analysis_time`. Split by spatial
+region and storm/date (not random tiles), so near-duplicate scenes and a single
+storm cannot leak into validation. Labels need trusted timestamped avalanche
+inventories, snapped to terrain cells, and a documented treatment of unobserved
+events. Do not label an unknown cell as a confident negative.
+
+All frames in one sample must use the same CRS, extent, resolution and terrain
+mask. Apply radiometric terrain correction, incidence-angle normalization,
+speckle handling, layover/shadow masks and per-channel normalization to
+Sentinel-1 before writing the arrays. Resample weather to each image timestamp.
+
+## Install and train
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+python3 -m pip install -r requirements-cpu.txt
+PYTHONPATH=src python3 -m avalanche_forecast.train \
+  --manifest data/manifest.csv --output runs/resnet50-s1
+```
+
+Use `--no-pretrained` only for an offline smoke run. The default downloads
+ImageNet ResNet-50 weights on first use. Set `--horizon-hours` to the exact
+label horizon used when creating data; it is recorded in the run metadata.
+
+## Validation before deployment
+
+Evaluate by season, region, elevation/aspect band, cloud/visibility class and
+event size. Report PR-AUC, recall at a fixed alert budget, Brier score,
+reliability curves, false negatives, and lead time. Fit calibration and choose
+any alert threshold only on a validation set; lock it before an independent
+seasonal test. A model that cannot beat weather/snowpack-only and persistence
+baselines should not be shipped.
+
+This repository intentionally contains no alerting endpoint. A production
+system should fail closed on stale imagery/weather, missing quality masks or an
+out-of-domain tile, then surface the inputs, uncertainty and provenance to a
+qualified forecaster.

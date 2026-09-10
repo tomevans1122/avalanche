@@ -1,0 +1,5 @@
+# CPU-only wheels keep a local research setup small and do not require CUDA.
+-r requirements.txt
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.14.0+cpu
+torchvision==0.29.0+cpu
