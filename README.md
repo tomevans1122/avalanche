@@ -47,6 +47,10 @@ storm cannot leak into validation. Labels need trusted timestamped avalanche
 inventories, snapped to terrain cells, and a documented treatment of unobserved
 events. Do not label an unknown cell as a confident negative.
 
+The ready-to-fill default pilot definition is in
+[`config/pilot-study.json`](config/pilot-study.json); the credential and
+inventory handoff is in [`docs/data-readiness.md`](docs/data-readiness.md).
+
 All frames in one sample must use the same CRS, extent, resolution and terrain
 mask. Apply radiometric terrain correction, incidence-angle normalization,
 speckle handling, layover/shadow masks and per-channel normalization to
@@ -65,6 +69,29 @@ PYTHONPATH=src python3 -m avalanche_forecast.train \
 Use `--no-pretrained` only for an offline smoke run. The default downloads
 ImageNet ResNet-50 weights on first use. Set `--horizon-hours` to the exact
 label horizon used when creating data; it is recorded in the run metadata.
+
+## Local dashboard
+
+After installation, launch a local-only dashboard with:
+
+```bash
+PYTHONPATH=src python3 -m avalanche_forecast.webapp
+```
+
+Open http://127.0.0.1:5000. Enter a manifest path within this project and the
+same forecast horizon used to generate its labels. The dashboard starts one
+training process at a time and displays `runs/web-*/train.log`; it does not
+make or display a terrain-safety prediction.
+
+For an end-to-end interface check only, create eight **synthetic** samples:
+
+```bash
+PYTHONPATH=src python3 -m avalanche_forecast.demo_data
+```
+
+Then enter `data/demo-manifest.csv` in the dashboard. This data is generated
+noise with artificial labels and must never be used for model evaluation or
+forecasting.
 
 ## Validation before deployment
 

@@ -1,0 +1,12 @@
+{
+  "name": "Mont Blanc pilot area",
+  "purpose": "Small, reproducible Alpine pilot before scaling to the full Alps.",
+  "bbox_wgs84": [6.72, 45.76, 7.06, 46.02],
+  "date_range": "2022-11-01T00:00:00Z/2024-05-31T23:59:59Z",
+  "analysis_horizon_hours": 6,
+  "primary_collection": "sentinel-1-grd",
+  "primary_channels": ["VV", "VH"],
+  "tile_resolution_metres": 20,
+  "sequence_length": 4,
+  "notes": "This area crosses France, Italy and Switzerland. Replace it with an avalanche-service-approved operational area before any serious evaluation."
+}

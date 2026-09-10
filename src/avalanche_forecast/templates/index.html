@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Alpine avalanche likelihood — research dashboard</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; background: #0d1720; color: #e6edf3; }
+    body { max-width: 850px; margin: 3rem auto; padding: 0 1rem; }
+    h1 { margin-bottom: .25rem; } .warning { border-left: 4px solid #f0ad4e; background:#24201a; padding: 1rem; }
+    form, section { margin-top: 1.25rem; background:#162431; padding:1.25rem; border-radius:8px; }
+    label { display:block; margin: .75rem 0 .25rem; } input { box-sizing:border-box; width:100%; padding:.6rem; }
+    button { margin-top:1rem; padding:.65rem 1rem; font-weight:600; cursor:pointer; }
+    pre { max-height:360px; overflow:auto; padding:1rem; background:#091018; white-space:pre-wrap; }
+    #message { color:#ffbd6e; min-height:1.25rem; } .muted { color:#aab7c4; }
+  </style>
+</head>
+<body>
+  <h1>Alpine avalanche likelihood</h1>
+  <p class="muted">Local research dashboard · 127.0.0.1 only</p>
+  <p class="warning"><strong>Not a safety product.</strong> This starts research training only. Do not use an output to decide whether terrain is safe.</p>
+  <form id="training-form">
+    <h2>Start a training run</h2>
+    <label for="manifest">Manifest path (inside this project)</label>
+    <input id="manifest" name="manifest" value="data/manifest.csv" required>
+    <label for="horizon_hours">Forecast horizon, hours</label>
+    <input id="horizon_hours" name="horizon_hours" value="6" type="number" min="0.1" max="72" step="0.1" required>
+    <button type="submit">Start training</button>
+    <p id="message"></p>
+  </form>
+  <section>
+    <h2>Run status</h2>
+    <p id="summary">Loading…</p>
+    <pre id="log">{{ status.log }}</pre>
+  </section>
+  <script>
+    const summary = document.querySelector('#summary');
+    const log = document.querySelector('#log');
+    const message = document.querySelector('#message');
+    async function refresh() {
+      const state = await fetch('/api/status').then(r => r.json());
+      summary.textContent = state.running ? `Training started ${state.started}; output: ${state.output}` :
+        (state.output ? `Finished (exit ${state.return_code}); output: ${state.output}` : 'No run has been started.');
+      log.textContent = state.log || 'No training log yet.';
+    }
+    document.querySelector('#training-form').addEventListener('submit', async event => {
+      event.preventDefault(); message.textContent = '';
+      const response = await fetch('/api/train', {method: 'POST', body: new FormData(event.target)});
+      const body = await response.json();
+      message.textContent = response.ok ? 'Training started.' : body.error;
+      refresh();
+    });
+    refresh(); setInterval(refresh, 2000);
+  </script>
+</body>
+</html>
