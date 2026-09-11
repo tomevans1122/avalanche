@@ -61,6 +61,13 @@ PYTHONPATH=src python3 -m avalanche_forecast.data_pipeline catalogue --limit 500
 # Download a deliberately bounded number of terrain-corrected scene/tile rasters.
 PYTHONPATH=src python3 -m avalanche_forecast.data_pipeline download --max-scenes 4
 
+# Prefer this leakage-safe workflow for report-proxy examples. It chooses only
+# pre-analysis scenes whose footprint intersects the event tile, then downloads
+# candidate scenes until it has a full quality-approved sequence or an audit of
+# why the example was rejected.
+PYTHONPATH=src python3 -m avalanche_forecast.data_pipeline sentinel-proxy-plan
+PYTHONPATH=src python3 -m avalanche_forecast.data_pipeline sentinel-select
+
 # Fetch hourly weather at each tile centre, then build labelled sequences.
 PYTHONPATH=src python3 -m avalanche_forecast.data_pipeline weather
 PYTHONPATH=src python3 -m avalanche_forecast.data_pipeline build-manifest \

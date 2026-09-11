@@ -31,6 +31,8 @@ TOKEN_URL = "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/
 PROCESS_URL = "https://sh.dataspace.copernicus.eu/api/v1/process"
 WEATHER_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 REGOBS_MAP_URL = "https://gis4.nve.no/map/rest/services/Mapservices/regobs2/MapServer"
+_CDSE_TOKEN: str | None = None
+_CDSE_TOKEN_EXPIRES_AT: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -111,12 +113,18 @@ def search_sentinel1(config: dict[str, Any], limit: int = 500, max_pages: int = 
 
 
 def cdse_token() -> str:
+    global _CDSE_TOKEN, _CDSE_TOKEN_EXPIRES_AT
+    if _CDSE_TOKEN and _CDSE_TOKEN_EXPIRES_AT and datetime.now(timezone.utc) < _CDSE_TOKEN_EXPIRES_AT:
+        return _CDSE_TOKEN
     client_id, secret = os.getenv("CDSE_CLIENT_ID"), os.getenv("CDSE_CLIENT_SECRET")
     if not client_id or not secret:
         raise RuntimeError("Set CDSE_CLIENT_ID and CDSE_CLIENT_SECRET; do not store them in the manifest.")
     response = requests.post(TOKEN_URL, data={"grant_type": "client_credentials", "client_id": client_id, "client_secret": secret}, timeout=30)
     response.raise_for_status()
-    return response.json()["access_token"]
+    payload = response.json()
+    _CDSE_TOKEN = payload["access_token"]
+    _CDSE_TOKEN_EXPIRES_AT = datetime.now(timezone.utc) + timedelta(seconds=max(60, int(payload.get("expires_in", 300)) - 60))
+    return _CDSE_TOKEN
 
 
 def download_processed_tile(tile: Tile, acquisition_time: str, destination: Path, resolution: int) -> None:
@@ -484,11 +492,147 @@ def sentinel_proxy_plan(config: dict[str, Any], inventory_path: Path, catalogue_
             "event_time": properties["event_time"],
             "analysis_time": analysis_time.isoformat().replace("+00:00", "Z"),
             "acquisitions": [moment.isoformat().replace("+00:00", "Z") for moment in preceding[-config["sequence_length"]:]],
+            "candidate_acquisitions": [moment.isoformat().replace("+00:00", "Z") for moment in preceding],
             "label_semantics": properties.get("label_semantics"),
         })
         if max_examples is not None and len(examples) >= max_examples:
             break
     return {"purpose": "pre-analysis Sentinel-1 sequence plan; not a training manifest", "sequence_length": config["sequence_length"], "history_days": history_days, "examples": examples, "skipped": skipped}
+
+
+def select_quality_approved_sentinel_sequences(config: dict[str, Any], plan_path: Path,
+                                                imagery_root: Path, max_attempts: int = 24,
+                                                start: int = 0, max_examples: int | None = None,
+                                                checkpoint_path: Path | None = None) -> dict[str, Any]:
+    """Download only enough candidate frames to form quality-approved sequences.
+
+    Each rejection is retained in the output audit.  This avoids treating a
+    catalogue hit as usable imagery and never substitutes a post-analysis scene.
+    """
+    plan = json.loads(plan_path.read_text())
+    tiles = {tile.tile_id: tile for tile in generate_tiles(config)}
+    selected, rejected = [], []
+    candidates = plan.get("examples", [])[start:None if max_examples is None else start + max_examples]
+    def result() -> dict[str, Any]:
+        return {"purpose": "quality-approved, pre-analysis Sentinel-1 sequences; not a training manifest",
+                "minimum_valid_fraction": .99, "sequence_length": config["sequence_length"],
+                "source_plan": str(plan_path), "start": start, "requested_examples": len(candidates),
+                "examples": selected, "rejected": rejected}
+    for example in candidates:
+        tile = tiles.get(example["tile_id"])
+        if tile is None:
+            rejected.append({"source_regobs_id": example.get("source_regobs_id"), "reason": "unknown_tile"})
+            continue
+        valid_frames, attempts = [], 0
+        # Start with the most recent eligible scene; results are re-sorted for
+        # temporal model input after enough quality-approved frames are found.
+        for acquisition in reversed(example.get("candidate_acquisitions", example.get("acquisitions", []))):
+            if attempts >= max_attempts or len(valid_frames) >= config["sequence_length"]:
+                break
+            attempts += 1
+            filename = utc(acquisition).strftime("%Y-%m-%dT%H:%M:%SZ.tif")
+            path = imagery_root / tile.tile_id / filename
+            try:
+                if not path.exists():
+                    download_processed_tile(tile, acquisition, path, config["tile_resolution_metres"])
+                quality = sentinel_quality(path)
+                if quality["valid_fraction"] < .99:
+                    rejected.append({"source_regobs_id": example.get("source_regobs_id"), "tile_id": tile.tile_id,
+                                     "acquisition": acquisition, "reason": "below_valid_coverage_threshold", "quality": quality})
+                    continue
+                # Verify the complete three-channel tensor contract now, not at
+                # a later training stage.
+                read_preprocessed_tiff(path)
+                valid_frames.append(acquisition)
+            except (OSError, ValueError, requests.RequestException) as exc:
+                rejected.append({"source_regobs_id": example.get("source_regobs_id"), "tile_id": tile.tile_id,
+                                 "acquisition": acquisition, "reason": "download_or_preprocess_failure", "detail": str(exc)})
+        if len(valid_frames) == config["sequence_length"]:
+            selected.append({**example, "acquisitions": sorted(valid_frames), "attempts": attempts,
+                             "selection_status": "quality_approved"})
+        else:
+            rejected.append({"source_regobs_id": example.get("source_regobs_id"), "tile_id": tile.tile_id,
+                             "reason": "insufficient_quality_approved_frames", "approved_frames": len(valid_frames), "attempts": attempts})
+        if checkpoint_path:
+            checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+            checkpoint_path.write_text(json.dumps(result(), indent=2))
+    return result()
+
+
+def sentinel_unlabeled_plan(config: dict[str, Any], weather_manifest: Path, catalogue_path: Path,
+                            history_days: int = 90) -> dict[str, Any]:
+    """Plan pre-analysis Sentinel-1 sequences for existing PU unlabeled windows."""
+    tiles = {tile.tile_id: tile for tile in generate_tiles(config)}
+    scenes = json.loads(catalogue_path.read_text()).get("features", [])
+    examples, skipped = [], []
+    rows = pd.read_csv(weather_manifest)
+    for row in rows.loc[rows.target == "unlabeled"].to_dict("records"):
+        tile = tiles.get(row["tile_id"])
+        if tile is None:
+            skipped.append({"path": row["path"], "reason": "unknown_tile"}); continue
+        analysis_time = utc(row["analysis_time"]); earliest = analysis_time - timedelta(days=history_days)
+        footprint = box(*tile.bbox_wgs84)
+        candidates = sorted({utc(scene["properties"]["datetime"]) for scene in scenes
+                             if scene.get("geometry") and scene.get("properties", {}).get("datetime")
+                             and footprint.intersects(shape(scene["geometry"]))
+                             and earliest <= utc(scene["properties"]["datetime"]) <= analysis_time})
+        if len(candidates) < config["sequence_length"]:
+            skipped.append({"path": row["path"], "tile_id": tile.tile_id, "reason": "insufficient_pre_analysis_scenes"}); continue
+        examples.append({"source_weather_path": row["path"], "target": "unlabeled", "split": row["split"],
+                         "tile_id": tile.tile_id, "analysis_time": row["analysis_time"],
+                         "candidate_acquisitions": [moment.isoformat().replace("+00:00", "Z") for moment in candidates],
+                         "acquisitions": [moment.isoformat().replace("+00:00", "Z") for moment in candidates[-config["sequence_length"]:]]})
+    return {"purpose": "pre-analysis Sentinel-1 plan for PU unlabeled examples", "examples": examples,
+            "skipped": skipped, "sequence_length": config["sequence_length"], "history_days": history_days}
+
+
+def build_multimodal_proxy_manifest(config: dict[str, Any], weather_manifest: Path,
+                                    positive_selection: Path, unlabeled_selection: Path,
+                                    imagery_root: Path, weather_root: Path, output: Path) -> None:
+    """Join quality-approved imagery and scene-time weather into PU `.npz` samples."""
+    weather_rows = pd.read_csv(weather_manifest)
+    def regobs_id(value: Any) -> str:
+        if pd.isna(value):
+            return ""
+        try:
+            return str(int(float(value)))
+        except (TypeError, ValueError):
+            return str(value)
+    positives_by_id = {regobs_id(row.source_regobs_id): row for row in weather_rows.loc[weather_rows.target == "positive"].itertuples(index=False)}
+    rows, omitted = [], []
+    sources = [(json.loads(positive_selection.read_text()).get("examples", []), "positive"),
+               (json.loads(unlabeled_selection.read_text()).get("examples", []), "unlabeled")]
+    for examples, target in sources:
+        for example in examples:
+            if target == "positive":
+                source = positives_by_id.get(regobs_id(example.get("source_regobs_id")))
+                if source is None:
+                    omitted.append({"reason": "positive_not_in_weather_manifest", "source_regobs_id": example.get("source_regobs_id")}); continue
+                split, source_id = source.split, str(source.source_regobs_id)
+            else:
+                split, source_id = example["split"], ""
+            tile_id = example["tile_id"]
+            paths = [imagery_root / tile_id / utc(value).strftime("%Y-%m-%dT%H:%M:%SZ.tif") for value in example["acquisitions"]]
+            weather_path = weather_root / f"{tile_id}.csv"
+            if not weather_path.exists() or not all(path.exists() for path in paths):
+                omitted.append({"reason": "missing_imagery_or_weather", "tile_id": tile_id}); continue
+            try:
+                imagery = np.stack([read_preprocessed_tiff(path) for path in paths])
+                timestamps = [utc(value) for value in example["acquisitions"]]
+                meteo = align_weather(pd.read_csv(weather_path), timestamps)
+            except ValueError as exc:
+                omitted.append({"reason": "preprocess_or_alignment_failure", "tile_id": tile_id, "detail": str(exc)}); continue
+            sample_path = output.parent / "multimodal-proxy-samples" / f"{target}_{tile_id}_{utc(example['analysis_time']).strftime('%Y%m%dT%H%M%S')}.npz"
+            sample_path.parent.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(sample_path, imagery=imagery, meteo=meteo, label=np.int64(target == "positive"))
+            storm = utc(example["analysis_time"]).date() - timedelta(days=utc(example["analysis_time"]).weekday() % config["storm_group_days"])
+            rows.append({"path": str(sample_path.relative_to(ROOT)), "split": split, "target": target, "tile_id": tile_id,
+                         "analysis_time": example["analysis_time"], "storm_group": storm.isoformat(), "source_regobs_id": source_id})
+    pd.DataFrame(rows).to_csv(output, index=False)
+    output.with_name("multimodal-proxy-omitted.csv").write_text(pd.DataFrame(omitted).to_csv(index=False))
+    output.with_name("multimodal-proxy-provenance.json").write_text(json.dumps({"training_method": "positive-unlabeled",
+        "warning": "Unlabeled rows are not negatives; do not use train.py BCE training.", "positive_selection": str(positive_selection),
+        "unlabeled_selection": str(unlabeled_selection), "created_at": datetime.now(timezone.utc).isoformat()}, indent=2))
 
 
 def main() -> None:
@@ -503,6 +647,9 @@ def main() -> None:
     screen = sub.add_parser("regobs-screen"); screen.add_argument("--input", default="data/inventory/regobs-raw.geojson"); screen.add_argument("--output", default="data/inventory/lyngen-regobs-proxy.geojson")
     weather_proxy = sub.add_parser("weather-proxy"); weather_proxy.add_argument("--inventory", default="data/inventory/lyngen-regobs-proxy.geojson"); weather_proxy.add_argument("--weather-root", default="data/weather"); weather_proxy.add_argument("--output", default="data/weather-proxy-manifest.csv")
     plan = sub.add_parser("sentinel-proxy-plan"); plan.add_argument("--inventory", default="data/inventory/lyngen-regobs-proxy.geojson"); plan.add_argument("--catalogue", default="data/catalogue/sentinel-1-items.json"); plan.add_argument("--output", default="data/sentinel-1-proxy-plan.json"); plan.add_argument("--max-examples", type=int); plan.add_argument("--history-days", type=int, default=90)
+    selection = sub.add_parser("sentinel-select"); selection.add_argument("--plan", default="data/sentinel-1-proxy-plan.json"); selection.add_argument("--imagery-root", default="data/processed/sentinel-1"); selection.add_argument("--output", default="data/sentinel-1-proxy-selection.json"); selection.add_argument("--max-attempts", type=int, default=24); selection.add_argument("--start", type=int, default=0); selection.add_argument("--max-examples", type=int)
+    unlabeled_plan = sub.add_parser("sentinel-unlabeled-plan"); unlabeled_plan.add_argument("--weather-manifest", default="data/weather-proxy-manifest.csv"); unlabeled_plan.add_argument("--catalogue", default="data/catalogue/sentinel-1-items.json"); unlabeled_plan.add_argument("--output", default="data/sentinel-1-unlabeled-plan.json"); unlabeled_plan.add_argument("--history-days", type=int, default=90)
+    multimodal = sub.add_parser("build-multimodal-proxy"); multimodal.add_argument("--weather-manifest", default="data/weather-proxy-manifest.csv"); multimodal.add_argument("--positive-selection", default="data/sentinel-1-proxy-selection.json"); multimodal.add_argument("--unlabeled-selection", default="data/sentinel-1-unlabeled-selection.json"); multimodal.add_argument("--imagery-root", default="data/processed/sentinel-1"); multimodal.add_argument("--weather-root", default="data/weather"); multimodal.add_argument("--output", default="data/multimodal-proxy-manifest.csv")
     args = parser.parse_args(); config = load_config()
     if args.command == "catalogue":
         output = ROOT / args.output; output.parent.mkdir(parents=True, exist_ok=True); output.write_text(json.dumps(search_sentinel1(config, args.limit, args.pages), indent=2))
@@ -538,6 +685,15 @@ def main() -> None:
     elif args.command == "sentinel-proxy-plan":
         output = ROOT / args.output; output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(sentinel_proxy_plan(config, ROOT / args.inventory, ROOT / args.catalogue, args.max_examples, args.history_days), indent=2))
+    elif args.command == "sentinel-select":
+        output = ROOT / args.output; output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(select_quality_approved_sentinel_sequences(config, ROOT / args.plan, ROOT / args.imagery_root, args.max_attempts, args.start, args.max_examples, output), indent=2))
+    elif args.command == "sentinel-unlabeled-plan":
+        output = ROOT / args.output; output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(sentinel_unlabeled_plan(config, ROOT / args.weather_manifest, ROOT / args.catalogue, args.history_days), indent=2))
+    elif args.command == "build-multimodal-proxy":
+        build_multimodal_proxy_manifest(config, ROOT / args.weather_manifest, ROOT / args.positive_selection,
+                                       ROOT / args.unlabeled_selection, ROOT / args.imagery_root, ROOT / args.weather_root, ROOT / args.output)
     else:
         build_manifest(config, ROOT / args.inventory, ROOT / args.imagery_root, ROOT / args.weather_root, ROOT / args.output)
 
