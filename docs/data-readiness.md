@@ -1,8 +1,7 @@
 # Data readiness
 
-`config/pilot-study.json` defines a deliberately small Mont Blanc pilot area
-(2022–23 and 2023–24 winters) for testing the pipeline. It is not an
-operational coverage definition.
+`config/pilot-study.json` defines a Lyngen, Norway pilot area (2021–25 winters)
+for testing the pipeline. It is not an operational coverage definition.
 
 ## Copernicus access
 
@@ -15,10 +14,11 @@ and [OAuth client authentication](https://documentation.dataspace.copernicus.eu/
 
 ## Event inventory requirement
 
-Before imagery is downloaded into training samples, obtain a licensed,
-timestamped avalanche-event inventory for the pilot area. Each record must at
-least identify an occurrence time and location/outline, observation confidence,
-and source. Confirm its licence permits machine-learning use.
+RegObs raw observation candidates can be downloaded with the pipeline. Retain
+their required attribution, then have a qualified reviewer create a separate
+reviewed inventory: each record needs occurrence time, location/outline,
+observation confidence, and source. Do not treat all public reports as
+confirmed events.
 
 The preparation process must join an event only to samples whose analysis time
 precedes the event by the configured six-hour horizon. It must retain unknown

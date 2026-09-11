@@ -36,7 +36,7 @@ one fixed projected terrain tile ending at `analysis_time`:
 
 ```text
 sample.npz
-  imagery: float32 [T, C, H, W]  # Sentinel-1: C=2, ordered VV,VH
+  imagery: float32 [T, C, H, W]  # Sentinel-1: C=3, ordered VV,VH,validity_mask
   meteo:   float32 [T, M]        # standardized, no values after analysis_time
   label:   int64 scalar          # 1 if a validated release occurs within horizon
 ```
@@ -50,6 +50,8 @@ events. Do not label an unknown cell as a confident negative.
 The ready-to-fill default pilot definition is in
 [`config/pilot-study.json`](config/pilot-study.json); the credential and
 inventory handoff is in [`docs/data-readiness.md`](docs/data-readiness.md).
+The full reproducible Lyngen/Norway preparation workflow is documented in
+[`docs/pipeline.md`](docs/pipeline.md).
 
 All frames in one sample must use the same CRS, extent, resolution and terrain
 mask. Apply radiometric terrain correction, incidence-angle normalization,
@@ -103,6 +105,32 @@ turn a bulletin into a model label or a safety recommendation. Services such as
 [Avalanche.report](https://lawinen-warnung.eu/more/open-data) publish CAAML
 bulletins for their covered regions; an API source must be selected that covers
 the configured pilot area.
+
+## Next steps for the Lyngen pilot
+
+The current artefact is a weather-only, positive-unlabelled (PU) research
+baseline. It was trained on automated high-confidence RegObs report proxies,
+not on an exhaustive, independently verified avalanche inventory. Its score is
+therefore an **uncalibrated report-likelihood ranking**, not an avalanche
+probability or safety recommendation.
+
+1. Evaluate the weather baseline once on the untouched chronological test
+   split. Report ranking performance, precision at practical alert budgets, and
+   variation by week and storm; do not tune using that split.
+2. Calibrate a probability only if a separate validation analysis establishes
+   sufficient, stable skill. Otherwise retain the output as a research score.
+3. Download and preprocess Sentinel-1 VV/VH tiles aligned to each analysis
+   time, applying the quality controls described above.
+4. Build multimodal `.npz` samples containing the Sentinel-1 history,
+   72-hour aligned weather history, terrain features, provenance, and explicit
+   positive/unlabelled/unknown status.
+5. Train the ResNet-50 plus temporal-GRU model and compare it fairly with the
+   weather-only baseline on the locked test split. Retain imagery only if it
+   provides a clear, repeatable held-out improvement.
+6. In the dashboard, present the selected research score alongside—not in
+   place of—the official Varsom bulletin and RegObs observations for Lyngen.
+7. Consider geographic expansion or revised labelling only after the
+   single-region pilot has passed the above evaluation and provenance review.
 
 ## Validation before deployment
 

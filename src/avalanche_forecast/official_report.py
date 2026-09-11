@@ -18,6 +18,12 @@ def pilot_region() -> str:
         return json.load(file)["name"]
 
 
+def official_region() -> str:
+    with (PROJECT_ROOT / "config" / "pilot-study.json").open() as file:
+        config = json.load(file)
+    return config.get("official_report_region", config["name"])
+
+
 def fetch_official_report() -> dict[str, object]:
     """Return a JSON bulletin from the explicitly configured provider endpoint.
 
@@ -48,6 +54,7 @@ def fetch_official_report() -> dict[str, object]:
         "configured": True,
         "model_region": pilot_region(),
         "report_region": configured_region or "Not declared",
-        "same_region": configured_region == pilot_region(),
+        "same_region": configured_region == official_region(),
+        "official_region": official_region(),
         "payload": payload,
     }

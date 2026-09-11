@@ -1,2 +1,7 @@
 numpy>=1.26
 pandas>=2.1
+requests>=2.31
+pyproj>=3.6
+shapely>=2.0
+# Required only by the GeoTIFF preprocessing/build-manifest commands.
+rasterio>=1.3

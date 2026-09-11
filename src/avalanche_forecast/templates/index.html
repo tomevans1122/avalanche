@@ -65,7 +65,7 @@
       } else {
         reportStatus.textContent = report.same_region ?
           `Region verified: ${report.report_region}` :
-          `Region mismatch — model: ${report.model_region}; report: ${report.report_region}`;
+          `Region mismatch — expected bulletin: ${report.official_region}; report: ${report.report_region}`;
         reportPayload.textContent = JSON.stringify(report.payload, null, 2);
       }
     }
