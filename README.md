@@ -93,6 +93,17 @@ Then enter `data/demo-manifest.csv` in the dashboard. This data is generated
 noise with artificial labels and must never be used for model evaluation or
 forecasting.
 
+### Official report panel
+
+The dashboard can show a JSON bulletin from an official regional avalanche
+service beside the model state. Set `OFFICIAL_REPORT_URL`, any required
+`OFFICIAL_REPORT_API_KEY`, and `OFFICIAL_REPORT_REGION` in a local `.env` or
+shell environment. The panel explicitly flags a region mismatch and does not
+turn a bulletin into a model label or a safety recommendation. Services such as
+[Avalanche.report](https://lawinen-warnung.eu/more/open-data) publish CAAML
+bulletins for their covered regions; an API source must be selected that covers
+the configured pilot area.
+
 ## Validation before deployment
 
 Evaluate by season, region, elevation/aspect band, cloud/visibility class and

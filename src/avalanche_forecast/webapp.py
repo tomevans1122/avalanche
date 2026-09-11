@@ -13,6 +13,8 @@ from pathlib import Path
 
 from flask import Flask, jsonify, render_template, request
 
+from .official_report import fetch_official_report, pilot_region
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 RUNS_ROOT = PROJECT_ROOT / "runs"
@@ -44,6 +46,11 @@ def _run_status() -> dict[str, object]:
             "output": str(output.relative_to(PROJECT_ROOT)) if output else None,
             "error": _run["error"],
             "log": log_text,
+            "model_region": pilot_region(),
+            "model_result": (
+                "A trained checkpoint exists, but no calibrated inference input is available."
+                if output else "No trained model result is available."
+            ),
         }
 
 
@@ -54,7 +61,7 @@ def index():
 
 @app.get("/api/status")
 def status():
-    return jsonify(_run_status())
+    return jsonify({**_run_status(), "official_report": fetch_official_report()})
 
 
 @app.post("/api/train")

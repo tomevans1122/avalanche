@@ -33,15 +33,41 @@
     <p id="summary">Loading…</p>
     <pre id="log">{{ status.log }}</pre>
   </section>
+  <section>
+    <h2>Same-region comparison</h2>
+    <p class="warning"><strong>Comparison, not validation.</strong> The official bulletin is authoritative; a research model must not override it.</p>
+    <h3>Research model</h3>
+    <p id="model-result">Loading…</p>
+    <h3>Official regional report</h3>
+    <p id="report-status">Loading…</p>
+    <pre id="report-payload">No report retrieved.</pre>
+  </section>
   <script>
     const summary = document.querySelector('#summary');
     const log = document.querySelector('#log');
     const message = document.querySelector('#message');
+    const modelResult = document.querySelector('#model-result');
+    const reportStatus = document.querySelector('#report-status');
+    const reportPayload = document.querySelector('#report-payload');
     async function refresh() {
       const state = await fetch('/api/status').then(r => r.json());
       summary.textContent = state.running ? `Training started ${state.started}; output: ${state.output}` :
         (state.output ? `Finished (exit ${state.return_code}); output: ${state.output}` : 'No run has been started.');
       log.textContent = state.log || 'No training log yet.';
+      modelResult.textContent = `${state.model_region}: ${state.model_result}`;
+      const report = state.official_report;
+      if (!report.configured) {
+        reportStatus.textContent = report.message;
+        reportPayload.textContent = 'Configure OFFICIAL_REPORT_URL and OFFICIAL_REPORT_REGION locally.';
+      } else if (report.error) {
+        reportStatus.textContent = report.error;
+        reportPayload.textContent = '';
+      } else {
+        reportStatus.textContent = report.same_region ?
+          `Region verified: ${report.report_region}` :
+          `Region mismatch — model: ${report.model_region}; report: ${report.report_region}`;
+        reportPayload.textContent = JSON.stringify(report.payload, null, 2);
+      }
     }
     document.querySelector('#training-form').addEventListener('submit', async event => {
       event.preventDefault(); message.textContent = '';

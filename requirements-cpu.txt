@@ -4,3 +4,4 @@
 torch==2.14.0+cpu
 torchvision==0.29.0+cpu
 Flask>=3.0
+python-dotenv>=1.0
