@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 
 import json
 
-from avalanche_forecast.data_pipeline import Tile, label_tile, regobs_where, screen_regobs_proxy, sentinel_proxy_plan, split_groups
+from avalanche_forecast.data_pipeline import Tile, _frost_hourly_measurement, label_tile, regobs_where, screen_regobs_proxy, sentinel_proxy_plan, split_groups
 
 
 TILE = Tile("tile", (6.5, 45.2, 6.6, 45.3), (0, 0, 1, 1))
@@ -54,3 +54,11 @@ def test_sentinel_plan_never_uses_post_analysis_acquisitions(tmp_path):
     inventory_path.write_text(json.dumps(inventory)); catalogue_path.write_text(json.dumps(catalogue))
     plan = sentinel_proxy_plan(config, inventory_path, catalogue_path)
     assert plan["examples"][0]["acquisitions"] == ["2024-01-01T00:00:00Z", "2024-01-05T00:00:00Z"]
+
+
+def test_frost_selection_requires_hourly_model_measurements_at_expected_heights():
+    assert _frost_hourly_measurement("air_temperature", "PT1H", {"levelType": "height_above_ground", "unit": "m", "value": 2})
+    assert _frost_hourly_measurement("wind_speed", "PT1H", {"levelType": "height_above_ground", "unit": "m", "value": 10})
+    assert _frost_hourly_measurement("sum(precipitation_amount PT1H)", "PT1H", None)
+    assert not _frost_hourly_measurement("air_temperature", "PT10M", {"levelType": "height_above_ground", "unit": "m", "value": 2})
+    assert not _frost_hourly_measurement("wind_speed", "PT1H", {"levelType": "height_above_ground", "unit": "m", "value": 2})

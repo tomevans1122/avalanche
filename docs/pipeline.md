@@ -110,3 +110,59 @@ This is positive-unlabeled training. Unlabeled windows are at least 48 hours
 from a proxy report and are never interpreted as negative labels. The output is
 an uncalibrated report-likelihood ranking score, not an avalanche probability
 or terrain-safety decision.
+
+### MET Norway Frost station observations
+
+When `FROST_CLIENT_ID` (and, if applicable, `FROST_CLIENT_SECRET`) are in
+`.env`, use Frost instead of treating gridded reanalysis as an observation.
+The pipeline accepts only hourly `PT1H` records: 2 m air temperature, 10 m wind
+speed and direction, and hourly precipitation. It searches a small configured
+buffer around Lyngen because the best valley station may lie just outside the
+warning-region envelope.
+
+```bash
+PYTHONPATH=src .venv/bin/python -m avalanche_forecast.data_pipeline frost-stations
+PYTHONPATH=src .venv/bin/python -m avalanche_forecast.data_pipeline frost-map
+
+# Start with a bounded coverage check; do not issue an unreviewed multi-year request.
+PYTHONPATH=src .venv/bin/python -m avalanche_forecast.data_pipeline frost-weather \
+  --date-range 2024-01-01T00:00:00Z/2024-01-31T23:00:00Z
+```
+
+This writes eligible stations, each proxy tile's nearest compatible station and
+its distance, plus weather CSV/JSON provenance in `data/weather-frost-hourly/`.
+It makes missing hourly observations explicit. `snowfall` is only a
+cold-precipitation proxy and is left missing when either input is missing.
+Reject weather windows with incomplete fields or an unsuitable station distance;
+the mapping is not evidence that station weather represents a particular slope.
+
+### Frost weather aligned to approved Sentinel-1 sequences
+
+For existing quality-approved Sentinel-1 selections, use the dedicated command
+below. It queries Frost candidates for the precise image/analysis period, then
+retains a tile only when one station has complete observed weather for all four
+image timestamps *and* that example's 72-hour model window. It does not
+interpolate or otherwise fill missing weather. The closest station meeting those
+requirements is recorded per example, including its distance from the tile.
+
+```bash
+PYTHONPATH=src .venv/bin/python -m avalanche_forecast.data_pipeline \
+  frost-sentinel-weather \
+  --selection data/lyngen-full-sentinel-proxy-selection.json \
+  --output data/weather-frost-sentinel-aligned
+
+# Write image-plus-weather samples without altering the existing PU training set.
+PYTHONPATH=src .venv/bin/python -m avalanche_forecast.data_pipeline \
+  build-multimodal-proxy --positive-only \
+  --positive-selection data/lyngen-full-sentinel-proxy-selection.json \
+  --imagery-root data/processed/lyngen-full-sentinel-1 \
+  --weather-root data/weather-frost-sentinel-aligned \
+  --output data/lyngen-full-frost-sentinel-alignment-manifest.csv
+```
+
+The command writes `sentinel-selection-weather-provenance.json` alongside the
+tile weather CSVs. The resulting `.npz` contains `imagery` shaped `[4,3,128,128]`
+and time-aligned `meteo` shaped `[4,5]`. This currently produces a
+**positive-only alignment set**: it verifies the data contract, but must not be
+used for training until comparable unlabeled sequences are acquired and split
+without leakage.

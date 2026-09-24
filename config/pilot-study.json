@@ -1,11 +1,11 @@
 {
-  "name": "Central Lyngen pilot",
+  "name": "Lyngen warning-region pilot",
   "avalanche_service_region": "LYNGEN",
   "regobs_region_name": "Lyngen",
   "official_report_region": "Lyngen",
   "country": "NO",
   "purpose": "Single-service Norwegian pilot using NVE RegObs observations and Varsom regional bulletins.",
-  "bbox_wgs84": [19.50, 69.55, 20.00, 69.80],
+  "bbox_wgs84": [19.00, 69.35, 21.25, 70.25],
   "date_range": "2021-11-01T00:00:00Z/2025-05-31T23:59:59Z",
   "analysis_horizon_hours": 6,
   "primary_collection": "sentinel-1-grd",
@@ -17,6 +17,7 @@
   "sequence_length": 4,
   "label_target": "reported_high_confidence_avalanche_observation_within_horizon",
   "weather_history_hours": 72,
+  "weather_station_search_buffer_degrees": 0.5,
   "unlabeled_to_positive_ratio": 4,
   "pu_assumed_class_prior": 0.05,
   "regobs_proxy_rules": {
@@ -24,5 +25,5 @@
     "require_avalanche_attributes": ["DestructiveSizeName", "AvalancheExtName"],
     "deduplicate_by": "RegID"
   },
-  "notes": "This is a central-core subset of the Lyngen Varsom warning region. RegObs reports are user-generated: preserve contributor attribution and require review before using a report as a positive label."
+  "notes": "This is a bounding envelope for the full Lyngen Varsom warning region. RegObs acquisition remains server-filtered to ForecastRegionName = Lyngen; the envelope is not itself a claim that every tile is inside the warning polygon. Reports are user-generated: preserve contributor attribution and require review before using a report as a positive label."
 }

@@ -120,10 +120,13 @@ probability or safety recommendation.
 2. Calibrate a probability only if a separate validation analysis establishes
    sufficient, stable skill. Otherwise retain the output as a research score.
 3. Download and preprocess Sentinel-1 VV/VH tiles aligned to each analysis
-   time, applying the quality controls described above.
-4. Build multimodal `.npz` samples containing the Sentinel-1 history,
-   72-hour aligned weather history, terrain features, provenance, and explicit
-   positive/unlabelled/unknown status.
+   time, applying the quality controls described above. The pilot now has a
+   small positive-only image/weather alignment set with Frost weather checked
+   at every selected image timestamp and throughout each 72-hour model window.
+4. Add comparable unlabeled Sentinel-1 sequences, then build a multimodal PU
+   dataset containing image history, aligned weather, terrain features,
+   provenance, and explicit positive/unlabelled/unknown status. Do not train
+   on the positive-only alignment set.
 5. Train the ResNet-50 plus temporal-GRU model and compare it fairly with the
    weather-only baseline on the locked test split. Retain imagery only if it
    provides a clear, repeatable held-out improvement.

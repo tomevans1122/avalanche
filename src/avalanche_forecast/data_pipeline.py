@@ -11,6 +11,11 @@ import hashlib
 import json
 import os
 import subprocess
+import tempfile
+import time
+import zipfile
+import calendar
+import math
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -30,6 +35,11 @@ STAC_URL = "https://stac.dataspace.copernicus.eu/v1/search"
 TOKEN_URL = "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token"
 PROCESS_URL = "https://sh.dataspace.copernicus.eu/api/v1/process"
 WEATHER_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
+ERA5_LAND_DATASET = "reanalysis-era5-land"
+FROST_SOURCES_URL = "https://frost.met.no/sources/v0.jsonld"
+FROST_SERIES_URL = "https://frost.met.no/observations/availableTimeSeries/v0.jsonld"
+FROST_OBSERVATIONS_URL = "https://frost.met.no/observations/v0.jsonld"
+FROST_ELEMENTS = ("air_temperature", "wind_speed", "wind_from_direction", "sum(precipitation_amount PT1H)")
 REGOBS_MAP_URL = "https://gis4.nve.no/map/rest/services/Mapservices/regobs2/MapServer"
 _CDSE_TOKEN: str | None = None
 _CDSE_TOKEN_EXPIRES_AT: datetime | None = None
@@ -110,6 +120,18 @@ def search_sentinel1(config: dict[str, Any], limit: int = 500, max_pages: int = 
         if not request_body:
             break
     return {"type": "FeatureCollection", "features": features, "pages_requested": max_pages, "query": payload}
+
+
+def merge_catalogues(inputs: list[Path]) -> dict[str, Any]:
+    """Merge seasonal STAC checkpoints, de-duplicating by STAC item ID."""
+    features: dict[str, dict[str, Any]] = {}
+    for path in inputs:
+        for feature in json.loads(path.read_text()).get("features", []):
+            identifier = feature.get("id")
+            if identifier:
+                features[identifier] = feature
+    ordered = sorted(features.values(), key=lambda feature: feature.get("properties", {}).get("datetime", ""))
+    return {"type": "FeatureCollection", "features": ordered, "sources": [str(path) for path in inputs]}
 
 
 def cdse_token() -> str:
@@ -211,6 +233,387 @@ def fetch_hourly_weather(tile: Tile, start: datetime, end: datetime, destination
     destination.parent.mkdir(parents=True, exist_ok=True)
     frame.to_csv(destination, index=False)
     destination.with_suffix(".json").write_text(json.dumps({"provider": "Open-Meteo archive", "request": params, "response_metadata": {k: v for k, v in payload.items() if k != "hourly"}}, indent=2))
+
+
+def fetch_hourly_weather_batch(tiles: list[Tile], start: datetime, end: datetime, output_dir: Path) -> None:
+    """Fetch several tile centres in one Open-Meteo request to avoid rate limits."""
+    if not tiles:
+        return
+    params = {"latitude": ",".join(str((tile.bbox_wgs84[1] + tile.bbox_wgs84[3]) / 2) for tile in tiles),
+              "longitude": ",".join(str((tile.bbox_wgs84[0] + tile.bbox_wgs84[2]) / 2) for tile in tiles),
+              "start_date": start.date().isoformat(), "end_date": end.date().isoformat(), "timezone": "UTC",
+              "hourly": "temperature_2m,precipitation,snowfall,wind_speed_10m,wind_direction_10m"}
+    response = requests.get(WEATHER_ARCHIVE_URL, params=params, timeout=120)
+    response.raise_for_status()
+    payloads = response.json()
+    payloads = payloads if isinstance(payloads, list) else [payloads]
+    if len(payloads) != len(tiles):
+        raise RuntimeError(f"weather batch returned {len(payloads)} payloads for {len(tiles)} tiles")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for tile, payload in zip(tiles, payloads):
+        frame = pd.DataFrame(payload["hourly"])
+        destination = output_dir / f"{tile.tile_id}.csv"
+        frame.to_csv(destination, index=False)
+        destination.with_suffix(".json").write_text(json.dumps({"provider": "Open-Meteo archive", "request": params,
+            "tile_id": tile.tile_id, "response_metadata": {k: v for k, v in payload.items() if k != "hourly"}}, indent=2))
+
+
+def fetch_era5_land_weather(tile: Tile, start: datetime, end: datetime, destination: Path) -> None:
+    """Retrieve hourly ERA5-Land at a tile centre using the user's CDS profile."""
+    try:
+        import cdsapi
+        import xarray as xr
+    except ImportError as exc:
+        raise RuntimeError("Install cdsapi, xarray, h5netcdf and h5py for ERA5-Land weather.") from exc
+    west, south, east, north = tile.bbox_wgs84
+    periods = []
+    cursor = datetime(start.year, start.month, 1, tzinfo=timezone.utc)
+    final_month = datetime(end.year, end.month, 1, tzinfo=timezone.utc)
+    while cursor <= final_month:
+        periods.append((cursor.year, cursor.month))
+        cursor = datetime(cursor.year + (cursor.month == 12), 1 if cursor.month == 12 else cursor.month + 1, 1, tzinfo=timezone.utc)
+    request_base = {"variable": ["2m_temperature", "total_precipitation", "10m_u_component_of_wind", "10m_v_component_of_wind"],
+                    "day": [f"{day:02d}" for day in range(1, 32)], "time": [f"{hour:02d}:00" for hour in range(24)],
+                    "data_format": "netcdf", "area": [north, west, south, east]}
+    frames = []
+    with tempfile.TemporaryDirectory() as temp_dir:
+        for year, month in periods:
+            first_day, last_day = datetime(year, month, 1, tzinfo=timezone.utc), datetime(year, month, calendar.monthrange(year, month)[1], 23, tzinfo=timezone.utc)
+            selected_start, selected_end = max(start, first_day), min(end, last_day)
+            request = {**request_base, "year": [str(year)], "month": [f"{month:02d}"],
+                       "day": [f"{day:02d}" for day in range(selected_start.day, selected_end.day + 1)]}
+            archive = Path(temp_dir) / f"era5-land-{year}-{month:02d}.zip"
+            cdsapi.Client().retrieve(ERA5_LAND_DATASET, request, str(archive))
+            with zipfile.ZipFile(archive) as bundle:
+                names = [name for name in bundle.namelist() if name.endswith(".nc")]
+                if len(names) != 1:
+                    raise RuntimeError(f"expected one NetCDF in ERA5-Land response, found {names}")
+                netcdf = Path(temp_dir) / f"{year}-{month:02d}.nc"; netcdf.write_bytes(bundle.read(names[0]))
+            dataset = xr.open_dataset(netcdf, engine="h5netcdf")
+            time_name = "valid_time" if "valid_time" in dataset.coords else "time"
+            def variable(*names: str):
+                return next((dataset[name] for name in names if name in dataset), None)
+            temperature, precipitation = variable("t2m", "2m_temperature"), variable("tp", "total_precipitation")
+            u_wind, v_wind = variable("u10", "10m_u_component_of_wind"), variable("v10", "10m_v_component_of_wind")
+            if any(value is None for value in (temperature, precipitation, u_wind, v_wind)):
+                raise RuntimeError(f"ERA5-Land response lacks required variables: {list(dataset.data_vars)}")
+            def point(values):
+                return values.squeeze(drop=True).to_numpy()
+            u, v = point(u_wind), point(v_wind)
+            temperature_c, precipitation_mm = point(temperature) - 273.15, point(precipitation) * 1000
+            frames.append(pd.DataFrame({"time": pd.to_datetime(dataset[time_name].to_numpy(), utc=True),
+                "temperature_2m": temperature_c, "precipitation": precipitation_mm,
+                "snowfall": np.where(temperature_c <= 0, precipitation_mm, 0), "wind_speed_10m": np.hypot(u, v),
+                "wind_direction_10m": (270 - np.degrees(np.arctan2(v, u))) % 360}))
+    frame = pd.concat(frames, ignore_index=True)
+    frame = frame.loc[(frame.time >= pd.Timestamp(start)) & (frame.time <= pd.Timestamp(end))]
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_csv(destination, index=False)
+    destination.with_suffix(".json").write_text(json.dumps({"provider": "Copernicus Climate Data Store ERA5-Land", "dataset": ERA5_LAND_DATASET,
+        "request": {**request_base, "periods": [f"{year}-{month:02d}" for year, month in periods], "chunking": "one calendar month per CDS request"}, "tile": asdict(tile), "derived_fields": {"snowfall": "precipitation where 2m temperature <= 0C; proxy, not an ERA5-Land snowfall variable"}, "source_units": {"temperature": "K", "precipitation": "m"}}, indent=2))
+
+
+def frost_auth() -> tuple[str, str]:
+    client_id = os.getenv("FROST_CLIENT_ID")
+    if not client_id:
+        raise RuntimeError("Set FROST_CLIENT_ID in .env; do not store it in generated data.")
+    return client_id, os.getenv("FROST_CLIENT_SECRET", "")
+
+
+def frost_get(url: str, *, params: dict[str, Any]) -> requests.Response:
+    """Retry a small number of transient Frost connection failures."""
+    for attempt in range(3):
+        try:
+            response = requests.get(url, params=params, auth=frost_auth(), timeout=120)
+            response.raise_for_status()
+            return response
+        except requests.RequestException:
+            if attempt == 2:
+                raise
+            time.sleep(attempt + 1)
+    raise AssertionError("unreachable")
+
+
+def _frost_hourly_measurement(element_id: str, time_resolution: str | None, level: dict[str, Any] | None) -> bool:
+    """Accept only the cadence and measurement heights expected by the model."""
+    if time_resolution != "PT1H":
+        return False
+    expected_height = {"air_temperature": 2, "wind_speed": 10, "wind_from_direction": 10}.get(element_id)
+    if expected_height is None:
+        return element_id == "sum(precipitation_amount PT1H)" and level is None
+    return bool(level and level.get("levelType") == "height_above_ground" and level.get("unit") == "m" and level.get("value") == expected_height)
+
+
+def frost_capable_stations(config: dict[str, Any], date_range: str | None = None) -> list[dict[str, Any]]:
+    """Find stations with all model-required hourly series for a specific period."""
+    west, south, east, north = config["bbox_wgs84"]
+    # Stations on a coast or valley edge can be just outside the warning-region
+    # envelope while being the closest usable observation source for a tile.
+    margin = float(config.get("weather_station_search_buffer_degrees", 0))
+    west, south, east, north = west - margin, south - margin, east + margin, north + margin
+    geometry = f"POLYGON(({west} {south},{east} {south},{east} {north},{west} {north},{west} {south}))"
+    sources = frost_get(FROST_SOURCES_URL, params={"geometry": geometry, "fields": "id,name,geometry,masl,validFrom,validTo"})
+    stations = sources.json().get("data", [])
+    available = frost_get(FROST_SERIES_URL, params={"sources": ",".join(item["id"] for item in stations),
+        "referencetime": date_range or config["date_range"], "elements": ",".join(FROST_ELEMENTS), "timeoffsets": "default", "levels": "default"})
+    elements: dict[str, set[str]] = {}
+    for series in available.json().get("data", []):
+        if _frost_hourly_measurement(series.get("elementId", ""), series.get("timeResolution"), series.get("level")):
+            elements.setdefault(series["sourceId"].split(":")[0], set()).add(series["elementId"])
+    return [station for station in stations if set(FROST_ELEMENTS).issubset(elements.get(station["id"], set()))]
+
+
+def _haversine_km(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
+    radians = math.pi / 180
+    a = math.sin((lat2 - lat1) * radians / 2) ** 2 + math.cos(lat1 * radians) * math.cos(lat2 * radians) * math.sin((lon2 - lon1) * radians / 2) ** 2
+    return 6371 * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def map_tile_rows_to_frost(tile_rows: list[dict[str, Any]], stations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Map existing tile coordinates to the nearest station valid for a retrieval period."""
+    if not stations:
+        raise RuntimeError("No Frost stations have all required hourly series for the requested period.")
+    rows = []
+    for tile in tile_rows:
+        tile_id, lon, lat = str(tile["tile_id"]), float(tile["tile_lon"]), float(tile["tile_lat"])
+        station = min(stations, key=lambda item: _haversine_km(lon, lat, item["geometry"]["coordinates"][0], item["geometry"]["coordinates"][1]))
+        station_lon, station_lat = station["geometry"]["coordinates"]
+        rows.append({"tile_id": tile_id, "tile_lon": lon, "tile_lat": lat, "station_id": station["id"], "station_name": station["name"],
+                     "station_masl": station.get("masl"), "station_lon": station_lon, "station_lat": station_lat,
+                     "distance_km": _haversine_km(lon, lat, station_lon, station_lat)})
+    return sorted(rows, key=lambda row: row["tile_id"])
+
+
+def map_proxy_tiles_to_frost(config: dict[str, Any], inventory_path: Path, stations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    tiles = proxy_event_tiles(config, inventory_path)
+    tile_rows = [{"tile_id": tile.tile_id,
+                  "tile_lon": (tile.bbox_wgs84[0] + tile.bbox_wgs84[2]) / 2,
+                  "tile_lat": (tile.bbox_wgs84[1] + tile.bbox_wgs84[3]) / 2} for tile in tiles]
+    return map_tile_rows_to_frost(tile_rows, stations)
+
+
+def write_frost_station_inventory(config: dict[str, Any], output: Path) -> list[dict[str, Any]]:
+    """Record eligible weather stations without downloading their observations yet."""
+    stations = frost_capable_stations(config)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps({
+        "provider": "MET Norway Frost",
+        "retrieved_at": datetime.now(timezone.utc).isoformat(),
+        "configured_date_range": config["date_range"],
+        "station_search_buffer_degrees": config.get("weather_station_search_buffer_degrees", 0),
+        "required_hourly_elements": list(FROST_ELEMENTS),
+        "selection_rule": "Stations inside the configured Lyngen envelope plus the configured search buffer, with all required series at compatible hourly cadence and measurement heights during the configured period.",
+        "stations": stations,
+    }, indent=2))
+    return stations
+
+
+def read_frost_station_inventory(path: Path) -> list[dict[str, Any]]:
+    payload = json.loads(path.read_text())
+    stations = payload.get("stations") if isinstance(payload, dict) else payload
+    if not isinstance(stations, list):
+        raise ValueError(f"Frost station inventory {path} has no stations list.")
+    return stations
+
+
+def write_frost_tile_mapping(config: dict[str, Any], inventory_path: Path, stations_path: Path, output: Path) -> list[dict[str, Any]]:
+    """Map proxy-event tiles to the closest capable Frost station, preserving distance for later screening."""
+    rows = map_proxy_tiles_to_frost(config, inventory_path, read_frost_station_inventory(stations_path))
+    output.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_csv(output, index=False)
+    output.with_suffix(".json").write_text(json.dumps({
+        "provider": "MET Norway Frost",
+        "inventory": str(inventory_path),
+        "station_inventory": str(stations_path),
+        "mapping_rule": "Nearest station with the required hourly series. Distance alone does not establish representativeness; later weather-window checks must retain it and enforce coverage thresholds.",
+        "required_hourly_elements": list(FROST_ELEMENTS),
+        "rows": rows,
+    }, indent=2))
+    return rows
+
+
+def _frost_hourly_frame(station_id: str, start: datetime, end: datetime) -> pd.DataFrame:
+    """Fetch only hourly Frost observations and make missing hours explicit.
+
+    Frost can return more than one time resolution for an element.  The model
+    consumes hourly windows, so retaining PT10M (for example) would silently
+    create duplicate timestamps and corrupt temporal alignment.
+    """
+    params = {
+        "sources": station_id,
+        "referencetime": f"{start.isoformat().replace('+00:00', 'Z')}/{end.isoformat().replace('+00:00', 'Z')}",
+        "elements": ",".join(FROST_ELEMENTS),
+        "timeoffsets": "default",
+        "levels": "default",
+        "qualities": "0,1,2,3,4",
+        "limit": 100_000,
+    }
+    response = frost_get(FROST_OBSERVATIONS_URL, params=params)
+    payload = response.json()
+    rows: dict[pd.Timestamp, dict[str, float]] = {}
+    columns = {
+        "air_temperature": "temperature_2m",
+        "sum(precipitation_amount PT1H)": "precipitation",
+        "wind_speed": "wind_speed_10m",
+        "wind_from_direction": "wind_direction_10m",
+    }
+    for record in payload.get("data", []):
+        timestamp = pd.Timestamp(record["referenceTime"])
+        target = rows.setdefault(timestamp, {})
+        for observation in record.get("observations", []):
+            column = columns.get(observation.get("elementId"))
+            if column and _frost_hourly_measurement(observation.get("elementId", ""), observation.get("timeResolution"), observation.get("level")) and "value" in observation:
+                target[column] = observation["value"]
+    frame = pd.DataFrame.from_dict(rows, orient="index")
+    frame.index = pd.to_datetime(frame.index, utc=True)
+    frame = frame.reindex(pd.date_range(pd.Timestamp(start), pd.Timestamp(end), freq="h"))
+    frame.index.name = "time"
+    for column in columns.values():
+        if column not in frame:
+            frame[column] = np.nan
+    # This is explicitly a cold-precipitation proxy; missing input remains
+    # missing rather than becoming an invented zero-snow observation.
+    frame["snowfall"] = np.where(
+        frame["temperature_2m"].notna() & frame["precipitation"].notna(),
+        np.where(frame["temperature_2m"] <= 0, frame["precipitation"], 0.0),
+        np.nan,
+    )
+    return frame.reset_index()[["time", "temperature_2m", "precipitation", "snowfall", "wind_speed_10m", "wind_direction_10m"]]
+
+
+def fetch_frost_mapped_weather(config: dict[str, Any], mapping_path: Path, output: Path, start: datetime, end: datetime,
+                               max_stations: int | None = None) -> None:
+    """Download station histories once and materialise matching tile histories.
+
+    A deliberately bounded date range is required at the CLI.  This prevents
+    accidental multi-year bulk traffic to Frost and lets coverage be inspected
+    before a larger research retrieval.
+    """
+    original_mapping = pd.read_csv(mapping_path)
+    if original_mapping.empty:
+        raise RuntimeError(f"Tile mapping {mapping_path} contains no rows.")
+    requested_date_range = f"{start.isoformat().replace('+00:00', 'Z')}/{end.isoformat().replace('+00:00', 'Z')}"
+    period_stations = frost_capable_stations(config, requested_date_range)
+    station_frames: dict[str, pd.DataFrame] = {}
+    station_coverage: dict[str, dict[str, float]] = {}
+    usable_stations: list[dict[str, Any]] = []
+    # Catalogue availability does not guarantee every expected hour is present.
+    # Fetch the bounded period once per candidate, then map a tile only to a
+    # station with complete required fields for that very period.
+    for station in period_stations:
+        try:
+            frame = _frost_hourly_frame(station["id"], start, end)
+        except requests.RequestException:
+            continue
+        coverage = {column: float(frame[column].notna().mean()) for column in frame.columns if column != "time"}
+        station_frames[station["id"]] = frame
+        station_coverage[station["id"]] = coverage
+        if all(value == 1.0 for value in coverage.values()):
+            usable_stations.append(station)
+    if not usable_stations:
+        raise RuntimeError("No Frost station has complete required hourly fields for the requested period; no weather was imputed.")
+    mapping = pd.DataFrame(map_tile_rows_to_frost(original_mapping.to_dict("records"), usable_stations))
+    station_ids = sorted(mapping["station_id"].dropna().unique())
+    if max_stations is not None:
+        station_ids = station_ids[:max_stations]
+    output.mkdir(parents=True, exist_ok=True)
+    (output / "retrieval-tile-stations.json").write_text(json.dumps({
+        "provider": "MET Norway Frost", "requested_date_range": requested_date_range,
+        "selection_rule": "Nearest station with compatible series and complete required hourly fields for this exact retrieval period.",
+        "candidate_station_coverage": station_coverage,
+        "source_mapping": str(mapping_path), "rows": mapping.to_dict("records"),
+    }, indent=2))
+    for station_id in station_ids:
+        station_rows = mapping.loc[mapping.station_id == station_id]
+        frame, coverage = station_frames[station_id], station_coverage[station_id]
+        station_dir = output / "stations"; station_dir.mkdir(parents=True, exist_ok=True)
+        frame.to_csv(station_dir / f"{station_id}.csv", index=False)
+        (station_dir / f"{station_id}.json").write_text(json.dumps({
+            "provider": "MET Norway Frost", "station_id": station_id,
+            "requested_date_range": requested_date_range,
+            "required_hourly_elements": list(FROST_ELEMENTS),
+            "selection": "PT1H observations only; requested quality codes 0 through 4.",
+            "derived_fields": {"snowfall": "precipitation where air_temperature <= 0C; proxy, not observed snowfall"},
+            "hourly_coverage": coverage,
+        }, indent=2))
+        for tile_id in station_rows.tile_id:
+            frame.to_csv(output / f"{tile_id}.csv", index=False)
+            (output / f"{tile_id}.json").write_text(json.dumps({
+                "provider": "MET Norway Frost", "station_id": station_id,
+                "tile_id": tile_id,
+                "mapping_row": station_rows.loc[station_rows.tile_id == tile_id].iloc[0].to_dict(),
+                "station_history": str((station_dir / f"{station_id}.csv").relative_to(ROOT)),
+                "hourly_coverage": coverage,
+            }, indent=2))
+
+
+def fetch_frost_weather_for_sentinel_selection(config: dict[str, Any], selection_path: Path, output: Path) -> dict[str, Any]:
+    """Retrieve only weather observations that fully support selected image sequences.
+
+    A station may have a gap elsewhere in a multi-day request but still contain
+    a complete 72-hour model window for a particular example.  This routine
+    tests that exact window and every Sentinel-1 timestamp; it never fills a
+    missing weather value.
+    """
+    examples = json.loads(selection_path.read_text()).get("examples", [])
+    if not examples:
+        raise RuntimeError(f"Sentinel selection {selection_path} contains no approved examples.")
+    tiles = {tile.tile_id: tile for tile in generate_tiles(config)}
+    analysis_times = [utc(example["analysis_time"]).replace(minute=0, second=0, microsecond=0) for example in examples]
+    acquisition_times = [utc(value).replace(minute=0, second=0, microsecond=0) for example in examples for value in example.get("acquisitions", [])]
+    start = min(min(analysis_times) - timedelta(hours=config["weather_history_hours"] - 1), min(acquisition_times))
+    end = max(analysis_times)
+    requested_date_range = f"{start.isoformat().replace('+00:00', 'Z')}/{end.isoformat().replace('+00:00', 'Z')}"
+    stations = frost_capable_stations(config, requested_date_range)
+    frames: dict[str, pd.DataFrame] = {}
+    for station in stations:
+        try:
+            frames[station["id"]] = _frost_hourly_frame(station["id"], start, end)
+        except requests.RequestException:
+            continue
+    selected, omitted, used_frames = [], [], {}
+    for example, analysis_time in zip(examples, analysis_times):
+        tile = tiles.get(example.get("tile_id"))
+        if tile is None:
+            omitted.append({"source_regobs_id": example.get("source_regobs_id"), "reason": "unknown_tile"}); continue
+        lon, lat = ((tile.bbox_wgs84[0] + tile.bbox_wgs84[2]) / 2, (tile.bbox_wgs84[1] + tile.bbox_wgs84[3]) / 2)
+        timestamps = [utc(value) for value in example.get("acquisitions", [])]
+        candidates = []
+        for station in stations:
+            frame = frames.get(station["id"])
+            if frame is None:
+                continue
+            try:
+                _weather_window(frame, analysis_time, config["weather_history_hours"])
+                align_weather(frame, timestamps)
+            except ValueError:
+                continue
+            candidates.append(station)
+        if not candidates:
+            omitted.append({"source_regobs_id": example.get("source_regobs_id"), "tile_id": tile.tile_id,
+                            "reason": "no_station_with_complete_model_window_and_image_timestamp_weather"})
+            continue
+        station = min(candidates, key=lambda item: _haversine_km(lon, lat, item["geometry"]["coordinates"][0], item["geometry"]["coordinates"][1]))
+        station_lon, station_lat = station["geometry"]["coordinates"]
+        used_frames[tile.tile_id] = (station, frames[station["id"]])
+        selected.append({"source_regobs_id": example.get("source_regobs_id"), "tile_id": tile.tile_id,
+                         "station_id": station["id"], "station_name": station["name"], "station_masl": station.get("masl"),
+                         "station_lon": station_lon, "station_lat": station_lat,
+                         "distance_km": _haversine_km(lon, lat, station_lon, station_lat),
+                         "analysis_time": example["analysis_time"], "acquisitions": example["acquisitions"]})
+    output.mkdir(parents=True, exist_ok=True)
+    for tile_id, (station, frame) in used_frames.items():
+        frame.to_csv(output / f"{tile_id}.csv", index=False)
+        (output / f"{tile_id}.json").write_text(json.dumps({
+            "provider": "MET Norway Frost", "station_id": station["id"], "tile_id": tile_id,
+            "requested_date_range": requested_date_range,
+            "selection": "Nearest station with complete observed fields for this example's 72-hour window and all Sentinel-1 timestamps; no imputation.",
+        }, indent=2))
+    result = {"provider": "MET Norway Frost", "requested_date_range": requested_date_range,
+              "selection": "Per-example nearest station with complete actual weather for the model window and Sentinel-1 acquisition timestamps.",
+              "selected": selected, "omitted": omitted}
+    (output / "sentinel-selection-weather-provenance.json").write_text(json.dumps(result, indent=2))
+    return result
 
 
 def _regobs_time(properties: dict[str, Any]) -> str | None:
@@ -503,7 +906,8 @@ def sentinel_proxy_plan(config: dict[str, Any], inventory_path: Path, catalogue_
 def select_quality_approved_sentinel_sequences(config: dict[str, Any], plan_path: Path,
                                                 imagery_root: Path, max_attempts: int = 24,
                                                 start: int = 0, max_examples: int | None = None,
-                                                checkpoint_path: Path | None = None) -> dict[str, Any]:
+                                                checkpoint_path: Path | None = None,
+                                                append_from: Path | None = None) -> dict[str, Any]:
     """Download only enough candidate frames to form quality-approved sequences.
 
     Each rejection is retained in the output audit.  This avoids treating a
@@ -511,7 +915,8 @@ def select_quality_approved_sentinel_sequences(config: dict[str, Any], plan_path
     """
     plan = json.loads(plan_path.read_text())
     tiles = {tile.tile_id: tile for tile in generate_tiles(config)}
-    selected, rejected = [], []
+    prior = json.loads(append_from.read_text()) if append_from and append_from.exists() else {}
+    selected, rejected = list(prior.get("examples", [])), list(prior.get("rejected", []))
     candidates = plan.get("examples", [])[start:None if max_examples is None else start + max_examples]
     def result() -> dict[str, Any]:
         return {"purpose": "quality-approved, pre-analysis Sentinel-1 sequences; not a training manifest",
@@ -587,10 +992,10 @@ def sentinel_unlabeled_plan(config: dict[str, Any], weather_manifest: Path, cata
 
 
 def build_multimodal_proxy_manifest(config: dict[str, Any], weather_manifest: Path,
-                                    positive_selection: Path, unlabeled_selection: Path,
+                                    positive_selection: Path, unlabeled_selection: Path | None,
                                     imagery_root: Path, weather_root: Path, output: Path) -> None:
     """Join quality-approved imagery and scene-time weather into PU `.npz` samples."""
-    weather_rows = pd.read_csv(weather_manifest)
+    weather_rows = pd.read_csv(weather_manifest) if unlabeled_selection is not None else pd.DataFrame()
     def regobs_id(value: Any) -> str:
         if pd.isna(value):
             return ""
@@ -598,17 +1003,19 @@ def build_multimodal_proxy_manifest(config: dict[str, Any], weather_manifest: Pa
             return str(int(float(value)))
         except (TypeError, ValueError):
             return str(value)
-    positives_by_id = {regobs_id(row.source_regobs_id): row for row in weather_rows.loc[weather_rows.target == "positive"].itertuples(index=False)}
+    positives_by_id = ({regobs_id(row.source_regobs_id): row for row in weather_rows.loc[weather_rows.target == "positive"].itertuples(index=False)}
+                       if unlabeled_selection is not None else {})
     rows, omitted = [], []
-    sources = [(json.loads(positive_selection.read_text()).get("examples", []), "positive"),
-               (json.loads(unlabeled_selection.read_text()).get("examples", []), "unlabeled")]
+    sources = [(json.loads(positive_selection.read_text()).get("examples", []), "positive")]
+    if unlabeled_selection is not None:
+        sources.append((json.loads(unlabeled_selection.read_text()).get("examples", []), "unlabeled"))
     for examples, target in sources:
         for example in examples:
             if target == "positive":
                 source = positives_by_id.get(regobs_id(example.get("source_regobs_id")))
-                if source is None:
+                if source is None and unlabeled_selection is not None:
                     omitted.append({"reason": "positive_not_in_weather_manifest", "source_regobs_id": example.get("source_regobs_id")}); continue
-                split, source_id = source.split, str(source.source_regobs_id)
+                split, source_id = (source.split, str(source.source_regobs_id)) if source is not None else ("", str(example.get("source_regobs_id", "")))
             else:
                 split, source_id = example["split"], ""
             tile_id = example["tile_id"]
@@ -628,40 +1035,70 @@ def build_multimodal_proxy_manifest(config: dict[str, Any], weather_manifest: Pa
             storm = utc(example["analysis_time"]).date() - timedelta(days=utc(example["analysis_time"]).weekday() % config["storm_group_days"])
             rows.append({"path": str(sample_path.relative_to(ROOT)), "split": split, "target": target, "tile_id": tile_id,
                          "analysis_time": example["analysis_time"], "storm_group": storm.isoformat(), "source_regobs_id": source_id})
+    if unlabeled_selection is None and rows:
+        split_groups(rows)
     pd.DataFrame(rows).to_csv(output, index=False)
     output.with_name("multimodal-proxy-omitted.csv").write_text(pd.DataFrame(omitted).to_csv(index=False))
     output.with_name("multimodal-proxy-provenance.json").write_text(json.dumps({"training_method": "positive-unlabeled",
         "warning": "Unlabeled rows are not negatives; do not use train.py BCE training.", "positive_selection": str(positive_selection),
-        "unlabeled_selection": str(unlabeled_selection), "created_at": datetime.now(timezone.utc).isoformat()}, indent=2))
+        "unlabeled_selection": str(unlabeled_selection) if unlabeled_selection else None,
+        "dataset_scope": "positive-only imagery/weather alignment set; not suitable for PU training" if unlabeled_selection is None else "positive-unlabeled",
+        "created_at": datetime.now(timezone.utc).isoformat()}, indent=2))
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
-    catalogue = sub.add_parser("catalogue"); catalogue.add_argument("--output", default="data/catalogue/sentinel-1-items.json"); catalogue.add_argument("--limit", type=int, default=500); catalogue.add_argument("--pages", type=int, default=10)
+    catalogue = sub.add_parser("catalogue"); catalogue.add_argument("--output", default="data/catalogue/sentinel-1-items.json"); catalogue.add_argument("--limit", type=int, default=500); catalogue.add_argument("--pages", type=int, default=10); catalogue.add_argument("--date-range", help="override configured ISO-8601 range for a bounded catalogue chunk")
+    catalogue_merge = sub.add_parser("catalogue-merge"); catalogue_merge.add_argument("--inputs", nargs="+", required=True); catalogue_merge.add_argument("--output", required=True)
     tiles = sub.add_parser("tiles"); tiles.add_argument("--output", default="data/tiles.json")
     weather = sub.add_parser("weather"); weather.add_argument("--output", default="data/weather"); weather.add_argument("--proxy-inventory", help="fetch only tiles containing proxy-positive reports")
+    era5_weather = sub.add_parser("era5-weather"); era5_weather.add_argument("--output", default="data/weather-era5-land"); era5_weather.add_argument("--proxy-inventory"); era5_weather.add_argument("--tile-id", action="append"); era5_weather.add_argument("--date-range", help="bounded ISO-8601 range for a CDS retrieval check")
+    frost_stations = sub.add_parser("frost-stations"); frost_stations.add_argument("--output", default="data/inventory/lyngen-frost-stations.json")
+    frost_map = sub.add_parser("frost-map"); frost_map.add_argument("--inventory", default="data/inventory/lyngen-full-regobs-proxy.geojson"); frost_map.add_argument("--stations", default="data/inventory/lyngen-frost-stations.json"); frost_map.add_argument("--output", default="data/inventory/lyngen-full-frost-tile-stations.csv")
+    frost_weather = sub.add_parser("frost-weather"); frost_weather.add_argument("--mapping", default="data/inventory/lyngen-full-frost-tile-stations.csv"); frost_weather.add_argument("--output", default="data/weather-frost-hourly"); frost_weather.add_argument("--date-range", required=True, help="bounded ISO-8601 range; retrieve a pilot period before broader history"); frost_weather.add_argument("--max-stations", type=int, help="optional cap for a small retrieval check")
+    frost_sentinel_weather = sub.add_parser("frost-sentinel-weather"); frost_sentinel_weather.add_argument("--selection", default="data/lyngen-full-sentinel-proxy-selection.json"); frost_sentinel_weather.add_argument("--output", default="data/weather-frost-sentinel")
     download = sub.add_parser("download"); download.add_argument("--catalogue", default="data/catalogue/sentinel-1-items.json"); download.add_argument("--output", default="data/processed/sentinel-1"); download.add_argument("--max-scenes", required=True, type=int)
     build = sub.add_parser("build-manifest"); build.add_argument("--inventory", required=True); build.add_argument("--imagery-root", default="data/processed/sentinel-1"); build.add_argument("--weather-root", default="data/weather"); build.add_argument("--output", default="data/manifest.csv")
     regobs = sub.add_parser("regobs"); regobs.add_argument("--output", default="data/inventory/regobs-raw.geojson")
     screen = sub.add_parser("regobs-screen"); screen.add_argument("--input", default="data/inventory/regobs-raw.geojson"); screen.add_argument("--output", default="data/inventory/lyngen-regobs-proxy.geojson")
     weather_proxy = sub.add_parser("weather-proxy"); weather_proxy.add_argument("--inventory", default="data/inventory/lyngen-regobs-proxy.geojson"); weather_proxy.add_argument("--weather-root", default="data/weather"); weather_proxy.add_argument("--output", default="data/weather-proxy-manifest.csv")
     plan = sub.add_parser("sentinel-proxy-plan"); plan.add_argument("--inventory", default="data/inventory/lyngen-regobs-proxy.geojson"); plan.add_argument("--catalogue", default="data/catalogue/sentinel-1-items.json"); plan.add_argument("--output", default="data/sentinel-1-proxy-plan.json"); plan.add_argument("--max-examples", type=int); plan.add_argument("--history-days", type=int, default=90)
-    selection = sub.add_parser("sentinel-select"); selection.add_argument("--plan", default="data/sentinel-1-proxy-plan.json"); selection.add_argument("--imagery-root", default="data/processed/sentinel-1"); selection.add_argument("--output", default="data/sentinel-1-proxy-selection.json"); selection.add_argument("--max-attempts", type=int, default=24); selection.add_argument("--start", type=int, default=0); selection.add_argument("--max-examples", type=int)
+    selection = sub.add_parser("sentinel-select"); selection.add_argument("--plan", default="data/sentinel-1-proxy-plan.json"); selection.add_argument("--imagery-root", default="data/processed/sentinel-1"); selection.add_argument("--output", default="data/sentinel-1-proxy-selection.json"); selection.add_argument("--max-attempts", type=int, default=24); selection.add_argument("--start", type=int, default=0); selection.add_argument("--max-examples", type=int); selection.add_argument("--append", action="store_true")
     unlabeled_plan = sub.add_parser("sentinel-unlabeled-plan"); unlabeled_plan.add_argument("--weather-manifest", default="data/weather-proxy-manifest.csv"); unlabeled_plan.add_argument("--catalogue", default="data/catalogue/sentinel-1-items.json"); unlabeled_plan.add_argument("--output", default="data/sentinel-1-unlabeled-plan.json"); unlabeled_plan.add_argument("--history-days", type=int, default=90)
-    multimodal = sub.add_parser("build-multimodal-proxy"); multimodal.add_argument("--weather-manifest", default="data/weather-proxy-manifest.csv"); multimodal.add_argument("--positive-selection", default="data/sentinel-1-proxy-selection.json"); multimodal.add_argument("--unlabeled-selection", default="data/sentinel-1-unlabeled-selection.json"); multimodal.add_argument("--imagery-root", default="data/processed/sentinel-1"); multimodal.add_argument("--weather-root", default="data/weather"); multimodal.add_argument("--output", default="data/multimodal-proxy-manifest.csv")
+    multimodal = sub.add_parser("build-multimodal-proxy"); multimodal.add_argument("--weather-manifest", default="data/weather-proxy-manifest.csv"); multimodal.add_argument("--positive-selection", default="data/sentinel-1-proxy-selection.json"); multimodal.add_argument("--unlabeled-selection", default="data/sentinel-1-unlabeled-selection.json"); multimodal.add_argument("--positive-only", action="store_true", help="build aligned positive examples only; this output must not be used for PU training"); multimodal.add_argument("--imagery-root", default="data/processed/sentinel-1"); multimodal.add_argument("--weather-root", default="data/weather"); multimodal.add_argument("--output", default="data/multimodal-proxy-manifest.csv")
     args = parser.parse_args(); config = load_config()
     if args.command == "catalogue":
-        output = ROOT / args.output; output.parent.mkdir(parents=True, exist_ok=True); output.write_text(json.dumps(search_sentinel1(config, args.limit, args.pages), indent=2))
+        query_config = {**config, "date_range": args.date_range} if args.date_range else config
+        output = ROOT / args.output; output.parent.mkdir(parents=True, exist_ok=True); output.write_text(json.dumps(search_sentinel1(query_config, args.limit, args.pages), indent=2))
+    elif args.command == "catalogue-merge":
+        output = ROOT / args.output; output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(merge_catalogues([ROOT / path for path in args.inputs]), indent=2))
     elif args.command == "tiles":
         output = ROOT / args.output; output.parent.mkdir(parents=True, exist_ok=True); output.write_text(json.dumps([asdict(tile) for tile in generate_tiles(config)], indent=2))
     elif args.command == "weather":
         start, end = (utc(value) for value in config["date_range"].split("/"))
         selected = proxy_event_tiles(config, ROOT / args.proxy_inventory) if args.proxy_inventory else generate_tiles(config)
+        missing = [tile for tile in selected if not (ROOT / args.output / f"{tile.tile_id}.csv").exists()]
+        for index in range(0, len(missing), 10):
+            fetch_hourly_weather_batch(missing[index:index + 10], start, end, ROOT / args.output)
+    elif args.command == "era5-weather":
+        start, end = (utc(value) for value in (args.date_range or config["date_range"]).split("/"))
+        tiles_by_id = {tile.tile_id: tile for tile in generate_tiles(config)}
+        selected = [tiles_by_id[tile_id] for tile_id in args.tile_id] if args.tile_id else proxy_event_tiles(config, ROOT / args.proxy_inventory)
         for tile in selected:
             path = ROOT / args.output / f"{tile.tile_id}.csv"
             if not path.exists():
-                fetch_hourly_weather(tile, start, end, path)
+                fetch_era5_land_weather(tile, start, end, path)
+    elif args.command == "frost-stations":
+        write_frost_station_inventory(config, ROOT / args.output)
+    elif args.command == "frost-map":
+        write_frost_tile_mapping(config, ROOT / args.inventory, ROOT / args.stations, ROOT / args.output)
+    elif args.command == "frost-weather":
+        start, end = (utc(value) for value in args.date_range.split("/"))
+        fetch_frost_mapped_weather(config, ROOT / args.mapping, ROOT / args.output, start, end, args.max_stations)
+    elif args.command == "frost-sentinel-weather":
+        fetch_frost_weather_for_sentinel_selection(config, ROOT / args.selection, ROOT / args.output)
     elif args.command == "download":
         features = json.loads((ROOT / args.catalogue).read_text()).get("features", [])[:args.max_scenes]
         if not features:
@@ -687,13 +1124,14 @@ def main() -> None:
         output.write_text(json.dumps(sentinel_proxy_plan(config, ROOT / args.inventory, ROOT / args.catalogue, args.max_examples, args.history_days), indent=2))
     elif args.command == "sentinel-select":
         output = ROOT / args.output; output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(json.dumps(select_quality_approved_sentinel_sequences(config, ROOT / args.plan, ROOT / args.imagery_root, args.max_attempts, args.start, args.max_examples, output), indent=2))
+        output.write_text(json.dumps(select_quality_approved_sentinel_sequences(config, ROOT / args.plan, ROOT / args.imagery_root, args.max_attempts, args.start, args.max_examples, output, output if args.append else None), indent=2))
     elif args.command == "sentinel-unlabeled-plan":
         output = ROOT / args.output; output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(sentinel_unlabeled_plan(config, ROOT / args.weather_manifest, ROOT / args.catalogue, args.history_days), indent=2))
     elif args.command == "build-multimodal-proxy":
         build_multimodal_proxy_manifest(config, ROOT / args.weather_manifest, ROOT / args.positive_selection,
-                                       ROOT / args.unlabeled_selection, ROOT / args.imagery_root, ROOT / args.weather_root, ROOT / args.output)
+                                       None if args.positive_only else ROOT / args.unlabeled_selection,
+                                       ROOT / args.imagery_root, ROOT / args.weather_root, ROOT / args.output)
     else:
         build_manifest(config, ROOT / args.inventory, ROOT / args.imagery_root, ROOT / args.weather_root, ROOT / args.output)
 
