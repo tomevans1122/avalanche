@@ -6,7 +6,7 @@
   "country": "NO",
   "purpose": "Single-service Norwegian pilot using NVE RegObs observations and Varsom regional bulletins.",
   "bbox_wgs84": [19.00, 69.35, 21.25, 70.25],
-  "date_range": "2021-11-01T00:00:00Z/2025-05-31T23:59:59Z",
+  "date_range": "2017-11-01T00:00:00Z/2025-05-31T23:59:59Z",
   "analysis_horizon_hours": 6,
   "primary_collection": "sentinel-1-grd",
   "primary_channels": ["VV", "VH", "validity_mask"],
