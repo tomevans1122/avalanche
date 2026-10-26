@@ -6,13 +6,24 @@
   <title>Alpine avalanche likelihood — research dashboard</title>
   <style>
     :root { color-scheme: dark; font-family: system-ui, sans-serif; background: #0d1720; color: #e6edf3; }
-    body { max-width: 850px; margin: 3rem auto; padding: 0 1rem; }
+    body { max-width: 960px; margin: 3rem auto; padding: 0 1rem; }
     h1 { margin-bottom: .25rem; } .warning { border-left: 4px solid #f0ad4e; background:#24201a; padding: 1rem; }
     form, section { margin-top: 1.25rem; background:#162431; padding:1.25rem; border-radius:8px; }
     label { display:block; margin: .75rem 0 .25rem; } input { box-sizing:border-box; width:100%; padding:.6rem; }
     button { margin-top:1rem; padding:.65rem 1rem; font-weight:600; cursor:pointer; }
     pre { max-height:360px; overflow:auto; padding:1rem; background:#091018; white-space:pre-wrap; }
     #message { color:#ffbd6e; min-height:1.25rem; } .muted { color:#aab7c4; }
+    #result-map { width:100%; height:auto; border-radius:6px; background:#0b1520; display:block; }
+    .tile { cursor:pointer; stroke:#d8e2ec; stroke-width:1.5; }
+    .tile:hover, .tile.selected { stroke:#fff; stroke-width:4; }
+    .sar-patch { pointer-events:none; image-rendering:pixelated; }
+    .reference-grid { fill:none; stroke:#9cafbd; stroke-opacity:.20; stroke-width:.65; pointer-events:none; }
+    #locator-map { width:100%; max-width:540px; height:auto; display:block; background:#0b1520; border-radius:6px; }
+    .norway-outline { fill:#29445a; stroke:#a9c5d8; stroke-width:1.4; }
+    .pilot-envelope { fill:#ffc857; fill-opacity:.72; stroke:#fff0b4; stroke-width:1.2; }
+    .legend { display:flex; gap:1rem; flex-wrap:wrap; font-size:.9rem; color:#c7d2dc; }
+    #tile-detail { min-height:7rem; }
+    #sar-preview { display:block; width:min(100%, 512px); image-rendering:pixelated; border:1px solid #536879; border-radius:4px; background:#000; }
   </style>
 </head>
 <body>
@@ -42,6 +53,23 @@
     <p id="report-status">Loading…</p>
     <pre id="report-payload">No report retrieved.</pre>
   </section>
+  <section>
+    <h2>Sentinel tile model results</h2>
+    <p class="warning"><strong>Research only.</strong> The colours are uncalibrated PU report-likelihood scores, not avalanche probabilities or terrain-safety advice.</p>
+    <p id="map-summary" class="muted">Loading matched satellite/weather tiles…</p>
+    <svg id="result-map" viewBox="0 0 1000 460" role="img" aria-label="Map of model results on Sentinel terrain tiles"></svg>
+    <p class="legend"><span>Greyscale: processed Sentinel-1 VV imagery</span><span>Low score <span style="color:#2474a6">■</span></span><span>High score <span style="color:#e45c31">■</span></span><span>White outline: selected input tile</span></p>
+    <h3>Selected tile</h3>
+    <pre id="tile-detail">Select a tile when results have loaded.</pre>
+    <h3>Model input imagery reference</h3>
+    <p class="muted">Final processed Sentinel-1 VV backscatter frame in the selected sequence. Brightness is stretched per tile (2nd–98th percentile); black pixels are invalid/masked. This is radar imagery, not natural colour.</p>
+    <img id="sar-preview" alt="Processed Sentinel-1 VV backscatter for the selected tile" hidden>
+  </section>
+  <section>
+    <h2>Norway locator</h2>
+    <p class="muted">The yellow rectangle is the Lyngen pilot envelope shown in the results map. The blue shape is a simplified mainland-Norway outline, included only to provide national context.</p>
+    <svg id="locator-map" viewBox="0 0 540 300" role="img" aria-label="Simplified mainland Norway map highlighting the Lyngen pilot area"></svg>
+  </section>
   <script>
     const summary = document.querySelector('#summary');
     const log = document.querySelector('#log');
@@ -49,6 +77,11 @@
     const modelResult = document.querySelector('#model-result');
     const reportStatus = document.querySelector('#report-status');
     const reportPayload = document.querySelector('#report-payload');
+    const mapSummary = document.querySelector('#map-summary');
+    const resultMap = document.querySelector('#result-map');
+    const tileDetail = document.querySelector('#tile-detail');
+    const sarPreview = document.querySelector('#sar-preview');
+    const locatorMap = document.querySelector('#locator-map');
     async function refresh() {
       const state = await fetch('/api/status').then(r => r.json());
       summary.textContent = state.running ? `Training started ${state.started}; output: ${state.output}` :
@@ -76,7 +109,104 @@
       message.textContent = response.ok ? 'Training started.' : body.error;
       refresh();
     });
+    function scoreColour(score) {
+      // Blue through amber/red; score is explicitly not a calibrated probability.
+      return `hsl(${210 - score * 195} 68% ${35 + score * 18}%)`;
+    }
+    function showTile(feature, element) {
+      resultMap.querySelectorAll('.tile').forEach(tile => tile.classList.remove('selected'));
+      element.classList.add('selected');
+      const input = feature.input;
+      tileDetail.textContent = [
+        `Tile: ${feature.tile_id}`,
+        `Analysis time: ${feature.analysis_time}`,
+        `PU research score: ${feature.score} (uncalibrated; not a probability)`,
+        `Training-set status: ${feature.target}`,
+        `Satellite/weather sequence: ${input.sequence_length} frames; imagery ${input.imagery_shape.join(' × ')}`,
+        `Latest weather feature vector: [${input.meteo_last_step.join(', ')}]`,
+        `Input file: ${feature.sample_path}`
+      ].join('\n');
+      sarPreview.hidden = false;
+      sarPreview.src = `/api/sar-preview?sample=${encodeURIComponent(feature.sample_path)}`;
+      sarPreview.alt = `Processed Sentinel-1 VV backscatter for ${feature.tile_id}, ${feature.analysis_time}`;
+    }
+    function drawResults(data) {
+      const [west, south, east, north] = data.region_bbox_wgs84;
+      const width = 1000, height = 460;
+      resultMap.replaceChildren();
+      const background = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+      background.setAttribute('width', width); background.setAttribute('height', height);
+      background.setAttribute('fill', '#102131'); resultMap.append(background);
+      const boundsToScreen = ([tileWest, tileSouth, tileEast, tileNorth]) => ({
+        x: ((tileWest - west) / (east - west)) * width,
+        y: ((north - tileNorth) / (north - south)) * height,
+        width: Math.max(2, ((tileEast - tileWest) / (east - west)) * width),
+        height: Math.max(2, ((tileNorth - tileSouth) / (north - south)) * height)
+      });
+      data.features.forEach((feature, index) => {
+        const position = boundsToScreen(feature.bbox_wgs84);
+        const image = document.createElementNS('http://www.w3.org/2000/svg', 'image');
+        image.setAttribute('x', position.x); image.setAttribute('y', position.y);
+        image.setAttribute('width', position.width); image.setAttribute('height', position.height);
+        image.setAttribute('href', `/api/sar-preview?sample=${encodeURIComponent(feature.sample_path)}`);
+        image.classList.add('sar-patch'); resultMap.append(image);
+        const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+        rect.setAttribute('x', position.x); rect.setAttribute('y', position.y);
+        rect.setAttribute('width', position.width); rect.setAttribute('height', position.height);
+        rect.setAttribute('fill', scoreColour(feature.score)); rect.setAttribute('fill-opacity', '.58'); rect.classList.add('tile');
+        const title = document.createElementNS('http://www.w3.org/2000/svg', 'title');
+        title.textContent = `${feature.tile_id}: score ${feature.score}, ${feature.analysis_time}`;
+        rect.append(title); rect.addEventListener('click', () => showTile(feature, rect));
+        resultMap.append(rect);
+        if (index === 0) showTile(feature, rect);
+      });
+      data.grid_bboxes_wgs84.forEach(bbox => {
+        const position = boundsToScreen(bbox);
+        const grid = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+        grid.setAttribute('x', position.x); grid.setAttribute('y', position.y);
+        grid.setAttribute('width', position.width); grid.setAttribute('height', position.height);
+        grid.classList.add('reference-grid'); resultMap.append(grid);
+      });
+    }
+    function drawLocator(data) {
+      // Deliberately simplified mainland outline for orientation, not a
+      // navigational or political-boundary data product.
+      const mainland = [[4.7,58.0],[5.8,59.1],[5.1,60.2],[5.3,61.2],[6.5,62.3],
+        [7.3,63.0],[9.1,63.7],[11.7,64.6],[11.9,65.5],[13.5,66.2],[13.9,67.0],
+        [15.5,67.7],[16.6,68.5],[18.4,69.2],[20.0,69.8],[21.7,70.2],[23.9,70.6],
+        [26.0,71.1],[28.5,70.9],[31.1,70.3],[30.2,69.7],[27.8,69.2],[25.3,68.9],
+        [22.8,68.6],[21.0,69.0],[19.1,68.6],[17.3,68.3],[15.8,67.7],[14.2,67.2],
+        [13.1,66.4],[12.3,65.7],[11.1,64.9],[9.6,64.2],[8.1,63.5],[7.0,62.6],
+        [5.8,61.6],[4.7,60.5],[4.5,59.2],[4.7,58.0]];
+      const west = 4, south = 57.6, east = 31.7, north = 71.5, width = 540, height = 300;
+      const point = ([lon, lat]) => [((lon - west) / (east - west)) * width, ((north - lat) / (north - south)) * height];
+      locatorMap.replaceChildren();
+      const outline = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+      outline.setAttribute('d', mainland.map((coordinate, index) => `${index ? 'L' : 'M'}${point(coordinate).join(' ')}`).join(' ') + 'Z');
+      outline.classList.add('norway-outline'); locatorMap.append(outline);
+      const [pilotWest, pilotSouth, pilotEast, pilotNorth] = data.region_bbox_wgs84;
+      const [x, y] = point([pilotWest, pilotNorth]); const [x2, y2] = point([pilotEast, pilotSouth]);
+      const envelope = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+      envelope.setAttribute('x', x); envelope.setAttribute('y', y);
+      envelope.setAttribute('width', Math.max(3, x2 - x)); envelope.setAttribute('height', Math.max(3, y2 - y));
+      envelope.classList.add('pilot-envelope');
+      const title = document.createElementNS('http://www.w3.org/2000/svg', 'title');
+      title.textContent = `${data.region} pilot envelope`; envelope.append(title); locatorMap.append(envelope);
+    }
+    async function loadResults() {
+      try {
+        const response = await fetch('/api/results'); const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Unable to calculate map results.');
+        mapSummary.textContent = `${data.region}: ${data.displayed_tiles} newest distinct input tiles shown from ${data.available_manifest_rows} manifest rows. ${data.coverage_note}`;
+        drawResults(data);
+        drawLocator(data);
+      } catch (error) {
+        mapSummary.textContent = `Map unavailable: ${error.message}`;
+        tileDetail.textContent = 'No map result loaded.';
+      }
+    }
     refresh(); setInterval(refresh, 2000);
+    loadResults();
   </script>
 </body>
 </html>
